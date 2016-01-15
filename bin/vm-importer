@@ -1,0 +1,178 @@
+#!/usr/bin/env ruby
+#
+# Author:: Bill Moritz (<billmoritz@gmail.com>)
+# Copyright:: Copyright (c) 2016 Bill Moritz.
+# License:: Apache License, Version 2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+require 'erb'
+require 'yaml'
+require 'aws-sdk'
+
+prog_dir = File.dirname(File.realpath(__FILE__))
+config_file = "#{prog_dir}/../config.yml"
+trust_policy_file = "#{prog_dir}/../policies/trust-policy.json"
+role_policy_template = "#{prog_dir}/../policies/role-policy.json.erb"
+
+# Ask a question and return the input
+def ask(question)
+  print question + ' '
+  gets.strip
+end
+
+# Return template result
+def get_template(file_name)
+  erb = ERB.new(File.open(file_name).read)
+  erb.result
+end
+
+# Slurp the configuration configuration
+config = File.file?(config_file) ? YAML.load(File.read(config_file)) : nil
+
+# Configure the AWS region
+@region = config['region'] ? config['region'] : ask('What AWS region are we using?')
+
+# Verify credentials
+begin
+  Aws.config.update(
+    region: @region,
+    credentials: Aws::SharedCredentials.new
+  )
+rescue StandardError => e
+  print 'Unable to load credentials: ', e
+  exit(1)
+end
+
+# Configure the s3 bucket
+@s3_bucket = config['s3_bucket'] ? config['s3_bucket'] : ask('S3 Bucket Name?')
+
+# Verify bucket exists
+begin
+  s3 = Aws::S3::Resource.new(region: @region)
+  s3.bucket(@s3_bucket).exists?
+rescue StandardError => e
+  print 'S3 bucket Error: ', e
+  exit(1)
+end
+
+# Configure the file name is set
+@file = config['file'] ? config['file'] : ask('File name?')
+
+# Verify the file exists
+unless File.file?(@file)
+  print 'File doesn\'t exist'
+  exit(1)
+end
+
+# Configure the image description
+@desc = config['desc'] ? config['desc'] : ask('Image description?')
+
+# Configure the IAM role name
+@iam_name = config['iam_name'] ? config['iam_name'] : 'vmimport'
+
+# Create Policy Document from Templates
+role_policy = get_template(role_policy_template)
+trust_policy = ERB.new(File.open(trust_policy_file).read).result
+
+# Create AWS Policy
+iam = Aws::IAM::Resource.new(region: @region)
+
+policies = iam.policies(scope: 'Local')
+policies.each do |policy_item|
+  @policy = policy_item.arn =~ /arn:aws:iam::[a-z0-9]*:policy\/#{@iam_name}$/ ? policy_item : nil
+end
+
+if @policy
+  puts "Policy #{@iam_name} already exists"
+else
+  puts "Creating Policy: #{@iam_name}"
+  iam.create_policy(
+    policy_name: @iam_name,
+    policy_document: role_policy
+  )
+end
+
+# Create AWS Role
+iam.roles.each do |role_item|
+  @role = role_item.name == @iam_name ? role_item : nil
+end
+
+if @role
+  puts "Role #{@iam_name} already exists"
+else
+  puts "Creating Role: #{@iam_name}"
+  iam.create_role(
+    role_name: @iam_name,
+    assume_role_policy_document: trust_policy
+  )
+end
+puts @s3_bucket
+puts @file
+# Upload file
+obj = s3.bucket(@s3_bucket).object(@file)
+begin
+  if obj.exists?
+    puts "Bucket #{@s3_bucket} contains #{@file}. No need to upload."
+  else
+    puts "Uploading: #{@file}"
+    obj.upload_file(@image, acl: 'aws-exec-read')
+  end
+rescue StandardError => e
+  print 'S3 Error: ', e
+  exit(1)
+end
+
+# Import image
+puts 'Creating import task.'
+ec2 = Aws::EC2::Client.new(region: @region)
+job = ec2.import_image(
+  description: @desc,
+  disk_containers: [
+    {
+      description: @disc,
+      user_bucket: {
+        s3_bucket: @s3_bucket,
+        s3_key: @file
+      }
+    }
+  ]
+)
+
+task_id = job.import_task_id
+status = ''
+while status != 'completed'
+  task = ec2.describe_import_image_tasks(import_task_ids: [task_id])
+  status = task.import_image_tasks[0].status
+  progress = task.import_image_tasks[0].progress
+  status_message = task.import_image_tasks[0].status_message
+  puts "#{Time.new} - #{task_id} - #{status} - #{progress} - #{status_message}"
+  sleep 10
+end
+
+puts 'Import complete'
+exit(0)
+
+# Clean up IAM
+iam.roles.each do |role_item|
+  @role = role_item.name == @iam_name ? role_item : nil
+end
+@role.delete
+
+policies = iam.policies(scope: 'Local')
+policies.each do |policy_item|
+  if policy_item.arn =~ %r{arn:aws:iam::[a-z0-9]*:policy/#{@iam_name}$}
+    @policy = policy_item
+  end
+end
+@policy.delete

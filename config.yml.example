@@ -1,0 +1,5 @@
+region: us-east-1
+s3_bucket: mys3bucket
+iam_name: vmimport
+file: Debian-8.2.0.ova
+desc: Debian 8.2.0
